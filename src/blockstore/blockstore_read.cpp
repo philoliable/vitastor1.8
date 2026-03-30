@@ -462,6 +462,10 @@ int blockstore_impl_t::read_bitmap(object_id oid, uint64_t target_version, void 
         {
             if (target_version >= wr->version)
             {
+                if (wr->type() == BS_HEAP_DELETE)
+                {
+                    return false;
+                }
                 found = true;
                 if (result_version)
                 {
