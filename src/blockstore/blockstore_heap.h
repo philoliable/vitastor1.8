@@ -117,10 +117,13 @@ struct heap_object_mvcc_t
 
 struct heap_block_info_t
 {
-    uint32_t used_space = 0;
+    struct __attribute__((__packed__))
+    {
+        uint32_t used_space = 0;
+        uint32_t garbage_space = 0;
+    };
     uint64_t mod_lsn = 0, mod_lsn_to = 0; // only 1 block write of LSN sequence is allowed at a moment
-    bool is_writing: 1;
-    bool has_garbage: 1;
+    bool is_writing = false;
     std::vector<heap_list_item_t*> entries;
 };
 
