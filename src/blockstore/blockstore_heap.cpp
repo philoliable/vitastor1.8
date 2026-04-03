@@ -1259,11 +1259,12 @@ int blockstore_heap_t::allocate_entry(uint32_t entry_size, uint32_t *block_num, 
     {
         // First try to write into the same block as the previous time
         auto & inf = block_info.at(last_allocated_block);
-        auto free_space = dsk->meta_block_size - inf.used_space + inf.garbage_space;
-        if (inf.is_writing || free_space < entry_size ||
+        if (inf.is_writing ||
+            inf.used_space - inf.garbage_space + entry_size > dsk->meta_block_size ||
             // Do not allow to make the last non-nearfull block nearfull
             !allow_last_free && meta_nearfull_blocks >= meta_block_count-1 &&
-            free_space >= max_entry_size && free_space < max_entry_size+entry_size)
+            inf.used_space - inf.garbage_space <= dsk->meta_block_size-max_entry_size &&
+            inf.used_space - inf.garbage_space + entry_size > dsk->meta_block_size-max_entry_size)
         {
             last_allocated_block = UINT32_MAX;
         }
@@ -1280,8 +1281,8 @@ int blockstore_heap_t::allocate_entry(uint32_t entry_size, uint32_t *block_num, 
         {
             // Do not allow to make the last non-nearfull block nearfull
             auto & inf = block_info.at(last_allocated_block);
-            auto free_space = dsk->meta_block_size - inf.used_space + inf.garbage_space;
-            if (free_space >= max_entry_size && free_space < max_entry_size+entry_size)
+            if (inf.used_space - inf.garbage_space <= dsk->meta_block_size-max_entry_size &&
+                inf.used_space - inf.garbage_space + entry_size > dsk->meta_block_size-max_entry_size)
             {
                 last_allocated_block = UINT32_MAX;
             }
@@ -1292,8 +1293,7 @@ int blockstore_heap_t::allocate_entry(uint32_t entry_size, uint32_t *block_num, 
             for (uint32_t b = meta_alloc->find(META_ALLOC_LEVELS-1); b != UINT32_MAX; b = meta_alloc->next(b))
             {
                 auto & inf = block_info.at(b);
-                auto free_space = dsk->meta_block_size - inf.used_space + inf.garbage_space;
-                if (free_space >= entry_size)
+                if (inf.used_space - inf.garbage_space + entry_size <= dsk->meta_block_size)
                 {
                     last_allocated_block = b;
                     break;
@@ -1310,8 +1310,8 @@ int blockstore_heap_t::allocate_entry(uint32_t entry_size, uint32_t *block_num, 
     {
         // Do not allow to make the last non-nearfull block nearfull
         auto & inf = block_info.at(last_allocated_block);
-        auto free_space = dsk->meta_block_size - inf.used_space + inf.garbage_space;
-        if (free_space >= max_entry_size && free_space+entry_size < max_entry_size)
+        if (inf.used_space - inf.garbage_space <= dsk->meta_block_size-max_entry_size &&
+            inf.used_space - inf.garbage_space + entry_size > dsk->meta_block_size-max_entry_size)
         {
             last_allocated_block = UINT32_MAX;
             return ENOSPC;
@@ -1321,9 +1321,16 @@ int blockstore_heap_t::allocate_entry(uint32_t entry_size, uint32_t *block_num, 
     *block_num = last_allocated_block;
     modify_alloc(last_allocated_block, [&](heap_block_info_t & inf)
     {
+        // Write just 1 entry to the block to collect garbage
+        if (inf.garbage_space > (inf.used_space-inf.garbage_space)/2)
+            last_allocated_block = UINT32_MAX;
         gc_block(inf);
         inf.used_space += entry_size;
         assert(inf.used_space - inf.garbage_space <= dsk->meta_block_size);
+        assert(!inf.mod_lsn_to || inf.mod_lsn_to == next_lsn);
+        ++next_lsn;
+        inf.mod_lsn = inf.mod_lsn ? inf.mod_lsn : next_lsn;
+        inf.mod_lsn_to = next_lsn;
     });
     return 0;
 }
@@ -1389,11 +1396,8 @@ int blockstore_heap_t::add_entry(uint32_t wr_size, uint32_t *modified_block,
     if (!inf.entries.size())
         inf.entries.reserve(dsk->meta_block_size / max_entry_size);
     inf.entries.push_back(li);
-    assert(!inf.mod_lsn_to || inf.mod_lsn_to == next_lsn);
-    new_wr->lsn = ++next_lsn;
+    new_wr->lsn = next_lsn;
     fill_entry(new_wr);
-    inf.mod_lsn = inf.mod_lsn ? inf.mod_lsn : next_lsn;
-    inf.mod_lsn_to = next_lsn;
     // Remember the object as dirty and remove older entries when this block is written and fsynced
     push_inflight_lsn(next_lsn, new_wr,
         (explicit_complete ? HEAP_INFLIGHT_EXPLICIT : 0) |
@@ -1733,7 +1737,7 @@ int blockstore_heap_t::add_delete(heap_entry_t *obj, uint32_t *modified_block)
 uint32_t blockstore_heap_t::meta_alloc_pos(const heap_block_info_t & inf)
 {
     auto real_used = (inf.used_space-inf.garbage_space);
-    if (inf.is_writing || real_used > dsk->meta_block_size-sizeof(heap_entry_t))
+    if (inf.is_writing || inf.mod_lsn || real_used > dsk->meta_block_size-sizeof(heap_entry_t))
     {
         // 100% full - no entry can be written into this block at all
         return META_ALLOC_LEVELS;
@@ -1775,11 +1779,19 @@ void blockstore_heap_t::modify_alloc(uint32_t block_num, std::function<void(heap
 
 void blockstore_heap_t::start_block_write(uint32_t block_num)
 {
-    modify_alloc(block_num, [&](heap_block_info_t & inf)
+    auto & inf = block_info.at(block_num);
+    assert(!inf.is_writing);
+    if (!inf.mod_lsn)
     {
-        assert(!inf.is_writing);
+        modify_alloc(block_num, [&](heap_block_info_t & inf)
+        {
+            inf.is_writing = true;
+        });
+    }
+    else
+    {
         inf.is_writing = true;
-    });
+    }
 }
 
 void blockstore_heap_t::complete_block_write(uint32_t block_num)
