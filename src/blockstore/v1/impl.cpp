@@ -877,7 +877,7 @@ uint64_t blockstore_impl_t::get_garbage_entries()
 
 uint64_t blockstore_impl_t::get_garbage_memory()
 {
-    return sizeof(blockstore_dirty_db_t::node_type) * dirty_db.size();
+    return (sizeof(obj_ver_id) + sizeof(dirty_entry) + 32) * dirty_db.size();
 }
 
 } // namespace v1
